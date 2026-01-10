@@ -5,13 +5,15 @@ import json
 import math
 import numpy as np
 import random
+import os
+from tqdm import tqdm
 from scipy.spatial import cKDTree
 
 # --- CONFIGURATION ---
 INPUT_FILE = '/home-local/tockier/weather/database_cities/worldcities.csv'
-OUTPUT_FILE = 'japan_weather_final.json'
-TARGET_COUNTRY = 'Japan'
-ANCHOR_PERCENTAGE = 0.05  # Base percentage for EACH pass (Total will be ~10%)
+OUTPUT_FILE = '/data/users/tockier/world_weather_final.json'
+CHECKPOINT_FILE = '/data/users/tockier/checkpoint_anchors.json'
+ANCHOR_PERCENTAGE = 0.05
 GRID_DEG = 0.18
 
 # API Config
@@ -19,23 +21,22 @@ API_URL = "https://api.open-meteo.com/v1/forecast"
 
 # --- PHASE 1: GRID GENERATION & DEDUPLICATION ---
 def generate_unique_grids():
-    print(f"🇯🇵 PHASE 1: Generating unique grids for {TARGET_COUNTRY}...")
-    
     try:
         df = pd.read_csv(INPUT_FILE)
     except FileNotFoundError:
         print("❌ Error: 'worldcities.csv' not found.")
-        return []
+        return [], []
 
-    # Filter Japan
-    df = df[df['country'] == TARGET_COUNTRY].copy()
-    
-    # Dictionary to handle collisions: {GridID: CityData}
+    # 1. Weather Representatives (One per Grid)
     grid_map = {}
+    
+    # 2. All City Lookups (One per City) - NEW LIST
+    all_city_lookups = []
     
     print(f"   Processing {len(df)} candidate cities...")
 
-    for idx, row in df.iterrows():
+    # WRAPPED WITH TQDM for ETA on initial processing
+    for idx, row in tqdm(df.iterrows(), total=df.shape[0], desc="Mapping Cities", unit="city"):
         lat, lon = row['lat'], row['lng']
         pop = row['population']
         
@@ -48,16 +49,32 @@ def generate_unique_grids():
         grid_lat = (gy * GRID_DEG) + (GRID_DEG/2)
         grid_lon = (gx * GRID_DEG) + (GRID_DEG/2)
         
+        city_name = row['city_ascii']
+        country_name = row['country'] # Capture Country
+        
+        # --- A. CREATE LOOKUP RECORD (For Search) ---
+        all_city_lookups.append({
+            "GridID": grid_id,
+            "Timestamp": "0000-00-00_METADATA", 
+            "Type": "CityLookup",
+            "LocationName": city_name,
+            "Country": country_name,  # <--- NEW FIELD
+            "Lat": lat, 
+            "Lon": lon,
+            "Population": pop if not pd.isna(pop) else 0
+        })
+
+        # --- B. COLLISION LOGIC (For Weather Generation) ---
         city_data = {
             "GridID": grid_id,
-            "City": row['city_ascii'],
-            "LocationName": row['city_ascii'],
+            "City": city_name,
+            "LocationName": city_name,
+            "Country": country_name, # <--- NEW FIELD
             "Lat": grid_lat,
             "Lon": grid_lon,
             "Population": pop if not pd.isna(pop) else 0
         }
         
-        # COLLISION LOGIC: Keep the city with the highest population
         if grid_id in grid_map:
             if city_data['Population'] > grid_map[grid_id]['Population']:
                 grid_map[grid_id] = city_data 
@@ -65,16 +82,12 @@ def generate_unique_grids():
             grid_map[grid_id] = city_data
 
     unique_grids = list(grid_map.values())
-    print(f"✅ Reduced to {len(unique_grids)} unique grids.")
+    print(f"✅ Created {len(all_city_lookups)} city lookup records.")
+    print(f"✅ Reduced to {len(unique_grids)} unique grids for weather generation.")
     
     # --- SAMPLING PASS 1: SYSTEMATIC SPATIAL (5%) ---
-    # Sort by Latitude (North -> South), then Longitude
     unique_grids.sort(key=lambda x: (-x['Lat'], x['Lon']))
-    
-    # Calculate Stride
     stride = int(1 / ANCHOR_PERCENTAGE)
-    
-    # Add random offset
     start_index = random.randint(0, stride - 1)
     
     spatial_count = 0
@@ -88,45 +101,51 @@ def generate_unique_grids():
     print(f"   Pass 1 (Spatial): Selected {spatial_count} anchors.")
 
     # --- SAMPLING PASS 2: POPULATION TOP-UP (5%) ---
-    # We want another 5% of the TOTAL grids, strictly based on population.
     target_pop_count = int(len(unique_grids) * ANCHOR_PERCENTAGE)
-    
-    # Filter for grids that are NOT yet anchors from Pass 1
-    # We create a list of candidates to sort, but we must modify the dictionary objects in place
     non_anchors = [g for g in unique_grids if not g['IsAnchor']]
-    
-    # Sort them by Population (Highest first)
     non_anchors.sort(key=lambda x: x['Population'], reverse=True)
     
     pop_count = 0
-    # Select the top N from the remaining candidates
     for i in range(min(len(non_anchors), target_pop_count)):
-        # Modifying the dictionary here reflects in the main 'unique_grids' list
         non_anchors[i]['IsAnchor'] = True 
         pop_count += 1
         
-    print(f"   Pass 2 (Population): Selected {pop_count} additional anchors (Top populated areas).")
+    print(f"   Pass 2 (Population): Selected {pop_count} additional anchors.")
     print(f"🎯 Total Anchors: {spatial_count + pop_count} (out of {len(unique_grids)} grids).")
     
-    return unique_grids
+    return unique_grids, all_city_lookups
 
-# --- PHASE 2: FETCH REAL DATA ---
+# --- PHASE 2: FETCH REAL DATA (WITH CHECKPOINTS) ---
 def fetch_anchors(grids):
     print(f"\n📡 PHASE 2: Fetching Real Data for Anchors...")
     
     anchor_grids = [g for g in grids if g['IsAnchor']]
     real_data_cache = {} 
     
+    # --- RESUME LOGIC ---
+    if os.path.exists(CHECKPOINT_FILE):
+        print(f"   ⚠️  Found checkpoint file '{CHECKPOINT_FILE}'. Resuming...")
+        try:
+            with open(CHECKPOINT_FILE, 'r') as f:
+                real_data_cache = json.load(f)
+            print(f"   ✅ Loaded {len(real_data_cache)} already fetched anchors.")
+        except Exception as e:
+            print(f"   ❌ Error loading checkpoint: {e}. Starting fresh.")
+
     params = {
         "hourly": "temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,wind_speed_10m",
         "daily": "temperature_2m_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max",
-        "timezone": "Asia/Tokyo",
+        "timezone": "UTC", 
         "forecast_days": 7
     }
 
-    for i, grid in enumerate(anchor_grids):
-        print(f"   [{i+1}/{len(anchor_grids)}] Fetching {grid['LocationName']}...")
-        
+    # Only fetch grids that are NOT in the cache
+    grids_to_fetch = [g for g in anchor_grids if g['GridID'] not in real_data_cache]
+    
+    print(f"   📝 Need to fetch {len(grids_to_fetch)} more anchors (Total: {len(anchor_grids)}).")
+
+    # CORRECT TQDM USAGE: wrap the list, THEN enumerate
+    for i, grid in enumerate(tqdm(grids_to_fetch, desc="Fetching API", unit="call")):
         try:
             p = params.copy()
             p['latitude'] = grid['Lat']
@@ -135,17 +154,30 @@ def fetch_anchors(grids):
             r = requests.get(API_URL, params=p, timeout=5)
             if r.status_code == 200:
                 real_data_cache[grid['GridID']] = r.json()
+            elif r.status_code == 429:
+                 print("\n   ❌ API LIMIT REACHED (429). Stop script (Ctrl+C) and retry later.")
             else:
-                print(f"❌ API Error {r.status_code}")
-            time.sleep(0.5)
+                # Use tqdm.write so the progress bar doesn't get messed up
+                tqdm.write(f"   ❌ API Error {r.status_code}")
+            
+            # Save checkpoint every 50 requests
+            if i % 50 == 0:
+                 with open(CHECKPOINT_FILE, 'w') as f:
+                    json.dump(real_data_cache, f)
+
+            time.sleep(0.1)
             
         except Exception as e:
-            print(f"❌ Exception: {e}")
+            tqdm.write(f"   ❌ Exception: {e}")
+            
+    # Final save of checkpoint
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump(real_data_cache, f)
             
     return real_data_cache
 
 # --- PHASE 3: INTERPOLATION ---
-def interpolate_and_save(all_grids, real_data_cache):
+def interpolate_and_save(all_grids, real_data_cache, all_city_lookups):
     print(f"\nmath PHASE 3: Creating Synthetic Data (Nearest Neighbor)...")
     
     valid_anchors = [g for g in all_grids if g['GridID'] in real_data_cache]
@@ -160,7 +192,12 @@ def interpolate_and_save(all_grids, real_data_cache):
     tree = cKDTree(anchor_coords)
     final_records = []
     
-    for grid in all_grids:
+    # 1. Add ALL City Lookups first
+    final_records.extend(all_city_lookups)
+    
+    # 2. Generate Weather for Grids
+    # WRAPPED WITH TQDM
+    for grid in tqdm(all_grids, desc="Interpolating", unit="grid"):
         # Find nearest anchor
         dist, idx = tree.query([grid['Lat'], grid['Lon']], k=1)
         nearest_anchor_id = anchor_ids[idx]
@@ -172,15 +209,15 @@ def interpolate_and_save(all_grids, real_data_cache):
         if is_satellite:
             noise_factor = np.random.normal(0, 0.5) + (dist * 2.0 * np.random.uniform(-1, 1))
 
-        # --- EXTRACT & TRANSFORM ---
         # Hourly
         h_data = source_data['hourly']
         for h in range(24):
             final_records.append({
                 "GridID": grid['GridID'],
-                "Timestamp": h_data['time'][h],
+                "Timestamp": h_data['time'][h], 
                 "Type": "Hourly",
-                "LocationName": grid['LocationName'],
+                "LocationName": grid['LocationName'], # Main city name
+                "Country": grid.get('Country', 'Unknown'), # <--- PASS COUNTRY TO WEATHER DATA TOO
                 "Lat": grid['Lat'],
                 "Lon": grid['Lon'],
                 "IsAnchor": grid['IsAnchor'],
@@ -196,9 +233,10 @@ def interpolate_and_save(all_grids, real_data_cache):
         for d in range(1, 7):
             final_records.append({
                 "GridID": grid['GridID'],
-                "Timestamp": f"{d_data['time'][d]}T12:00:00",
+                "Timestamp": f"{d_data['time'][d]}T12:00:00", 
                 "Type": "Daily",
                 "LocationName": grid['LocationName'],
+                "Country": grid.get('Country', 'Unknown'), # <--- PASS COUNTRY TO WEATHER DATA TOO
                 "Lat": grid['Lat'],
                 "Lon": grid['Lon'],
                 "IsAnchor": grid['IsAnchor'],
@@ -214,7 +252,7 @@ def interpolate_and_save(all_grids, real_data_cache):
     print(f"🎉 Pipeline Complete! Saved {len(final_records)} records to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
-    grids = generate_unique_grids()
+    grids, lookups = generate_unique_grids()
     if grids:
         real_data = fetch_anchors(grids)
-        interpolate_and_save(grids, real_data)
+        interpolate_and_save(grids, real_data, lookups)
