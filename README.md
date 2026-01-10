@@ -1,19 +1,19 @@
-Distributed Global Meteorological Repository
+# Distributed Global Meteorological Repository
 
 This document outlines the architecture and operational protocols of a distributed meteorological retrieval system designed to facilitate the dissemination of real-time and estimated atmospheric data across a global network comprising in excess of 47,000 urban centers.
 
 The system implements a Grid-Based Spatial Interpolation methodology to ensure ubiquitous global coverage while simultaneously diminishing dependency on external Application Programming Interfaces (APIs) by a magnitude of ninety percent. The infrastructure is underpinned by AWS DynamoDB, utilizing a Single Table Design architecture optimized for the querying of geospatial time-series data.
 
-I. Operational Prerequisites and Initialization
+## I. Operational Prerequisites and Initialization
 
-1. System Requirementsa
+### 1. System Requirements
 
 The successful deployment of this system is contingent upon the availability of the following:
 - Python 3.8+ execution environment.
 - AWS Credentials (Compatible with Standard and AWS Academy/VocLabs accounts).
 - pip (Python package manager).
 
-2. Installation Protocol
+### 2. Installation Protocol
 
 The acquisition of the repository and the subsequent installation of necessary dependencies shall be executed via the following directive:
 ```
@@ -49,11 +49,11 @@ aws_secret_access_key = ...
 aws_session_token = [INSERT_TOKEN_STRING_HERE]
 ```
 
-II. Pipeline Execution Protocols
+## II. Pipeline Execution Protocols
 
 The functionality of the system is segmented into three distinct operational phases. Phases I and II are typically executed a single time for database construction, whereas Phase III constitutes the recurring query operation.
 
-Phase I: Data Generation and Interpolation
+### Phase I: Data Generation and Interpolation
 
 This procedure instantiates the global grid reference system, acquires meteorological data for ten percent of the grid ('Anchor' nodes), and applies mathematical interpolation to derive data for the remaining ninety percent. The execution of generate_data.py initiates this process. It should be noted that a checkpointing mechanism is employed to mitigate interruptions caused by API rate limiting.
 - Input Source: worldcities.csv
@@ -71,16 +71,16 @@ Input Source: world_weather_final.json
 
 Target Destination: AWS DynamoDB Table (WeatherForecast)
 
-# Recommended for local execution environments
+#### Recommended for local execution environments
 python laptop_uploader.py
 
-# Alternative upload utility
+#### Alternative upload utility
 python upload_dynamo.py
 
 
 Financial Disclaimer: The uploading of approximately one million records in DynamoDB On-Demand mode incurs a financial cost proportional to the volume of write operations, estimated between $1.50 and $2.50 USD.
 
-Phase III: Query Interface
+### Phase III: Query Interface
 
 The retrieval of meteorological data is facilitated through the command-line interface.
 ```
@@ -134,11 +134,11 @@ Sort Key (SK): Timestamp
 
 Indexing Strategy: A Global Secondary Index (GSI) is maintained on the LocationName attribute to facilitate O(1) complexity lookups.
 
-V. Diagnostic and Remediation Procedures
+## V. Diagnostic and Remediation Procedures
 
 Case: "ResourceNotFoundException" during upload
 In the event of a ResourceNotFoundException, it may be inferred that the DynamoDB table has not been initialized. The manual execution of the following table creation command is prescribed:
-
+```
 aws dynamodb create-table \
     --table-name WeatherForecast \
     --attribute-definitions AttributeName=GridID,AttributeType=S AttributeName=Timestamp,AttributeType=S AttributeName=LocationName,AttributeType=S \
@@ -146,7 +146,7 @@ aws dynamodb create-table \
     --billing-mode PAY_PER_REQUEST \
     --global-secondary-indexes "IndexName=CityNameIndex,KeySchema=[{AttributeName=LocationName,KeyType=HASH},{AttributeName=Timestamp,KeyType=RANGE}],Projection={ProjectionType=ALL}" \
     --region us-east-1
-
+```
 
 Case: "AccessDeniedException" during query
 This error typically indicates the expiration of ephemeral credentials. The rectification procedure involves the acquisition of new credentials from the AWS Academy console and the subsequent updating of the ~/.aws/credentials file.
