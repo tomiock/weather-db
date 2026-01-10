@@ -4,7 +4,7 @@ import math
 import sys
 
 # --- CONFIGURATION ---
-USE_LOCAL_DB = True
+USE_LOCAL_DB = False
 TABLE_NAME = 'WeatherForecast'
 GRID_DEG = 0.18
 
