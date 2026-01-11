@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Global Weather Grid</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <style>
+        body { margin: 0; padding: 0; font-family: sans-serif; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; z-index: 1; }
+        
+        /* UI Control Panel */
+        #controls {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            z-index: 1000;
+            width: 300px;
+        }
+
+        h2 { margin: 0 0 10px 0; font-size: 18px; }
+        
+        .control-group { margin-bottom: 15px; }
+        label { display: block; font-weight: bold; margin-bottom: 5px; font-size: 12px; }
+        
+        select, input[type=range] { width: 100%; }
+        
+        #time-display {
+            font-size: 14px;
+            color: #2c3e50;
+            font-weight: bold;
+            text-align: center;
+            margin-top: 5px;
+        }
+
+        #status {
+            font-size: 12px;
+            text-align: center;
+            margin-top: 10px;
+            font-weight: bold;
+        }
+        
+        .status-loading { color: #e67e22; }
+        .status-ready { color: #27ae60; }
+        .status-zoom { color: #c0392b; }
+
+        /* Grid Label Styling */
+        .grid-label {
+            background: transparent;
+            border: none;
+            box-shadow: none;
+            color: white;
+            font-weight: bold;
+            text-shadow: 1px 1px 2px black;
+            font-size: 10px;
+            text-align: center;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <h2>Weather Controller</h2>
+        
+        <div class="control-group">
+            <label>Data Layer</label>
+            <select id="layer-select" onchange="updateMapColors()">
+                <option value="Temperature">Temperature (°C)</option>
+                <option value="Precipitation">Precipitation (mm)</option>
+                <option value="WindSpeed">Wind Speed (km/h)</option>
+                <option value="Humidity">Humidity (%)</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>Time Selector</label>
+            <input type="range" id="time-slider" min="0" max="0" value="0" disabled>
+            <div id="time-display">Loading timestamps...</div>
+        </div>
+
+        <div id="status" class="status-loading">Initializing...</div>
+        
+        <div style="font-size: 10px; color: #777; margin-top: 10px;">
+            Pan map to update data.
+            <br><b>Zoom Level 6+</b> required to fetch data.
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script>
+        // --- CONFIG ---
+        const GRID_DEG = 0.18;
+        const LABEL_ZOOM_THRESHOLD = 9; // Show labels
+        const FETCH_ZOOM_THRESHOLD = 6; // Allow fetching data
+
+        // --- STATE ---
+        let map;
+        let gridLayer = new L.LayerGroup();
+        let labelLayer = new L.LayerGroup();
+        let weatherData = []; 
+        let timestamps = [];
+        let currentTimestampIndex = 0;
+
+        // --- INITIALIZATION ---
+        function initMap() {
+            // Start centered on Europe/Africa
+            map = L.map('map').setView([41.38, 2.16], 8); // Start zoomed in on Barcelona
+
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+                subdomains: 'abcd',
+                maxZoom: 19
+            }).addTo(map);
+
+            gridLayer.addTo(map);
+            
+            // Events
+            map.on('zoomend', handleViewChange);
+            map.on('moveend', handleViewChange);
+
+            fetchTimestamps();
+        }
+
+        function handleViewChange() {
+            // Handle Labels
+            const z = map.getZoom();
+            if (z >= LABEL_ZOOM_THRESHOLD) {
+                if (!map.hasLayer(labelLayer)) map.addLayer(labelLayer);
+            } else {
+                if (map.hasLayer(labelLayer)) map.removeLayer(labelLayer);
+            }
+
+            // Handle Data Fetching
+            if (timestamps.length > 0) {
+                fetchWeather(currentTimestampIndex);
+            }
+        }
+
+        // --- DATA FETCHING ---
+        async function fetchTimestamps() {
+            try {
+                const res = await fetch('/api/timestamps');
+                timestamps = await res.json();
+                
+                const slider = document.getElementById('time-slider');
+                slider.max = timestamps.length - 1;
+                slider.disabled = false;
+                
+                updateTimeDisplay(0);
+                
+                // Add Listeners
+                slider.addEventListener('input', (e) => updateTimeDisplay(e.target.value));
+                slider.addEventListener('change', (e) => {
+                    currentTimestampIndex = e.target.value;
+                    fetchWeather(currentTimestampIndex);
+                });
+                
+                // Initial Fetch
+                handleViewChange(); 
+
+            } catch (err) {
+                console.error("Failed to load timestamps", err);
+                document.getElementById('status').innerText = "DB Error";
+            }
+        }
+
+        function updateTimeDisplay(index) {
+            const ts = timestamps[index];
+            const date = new Date(ts);
+            document.getElementById('time-display').innerText = date.toLocaleString();
+        }
+
+        async function fetchWeather(index) {
+            const statusDiv = document.getElementById('status');
+            const z = map.getZoom();
+
+            // 1. Check Zoom
+            if (z < FETCH_ZOOM_THRESHOLD) {
+                statusDiv.innerText = "Zoom in to load data";
+                statusDiv.className = "status-zoom";
+                gridLayer.clearLayers();
+                labelLayer.clearLayers();
+                return;
+            }
+
+            // 2. Prepare Query
+            statusDiv.innerText = "⏳ Querying Area...";
+            statusDiv.className = "status-loading";
+            
+            const bounds = map.getBounds();
+            const ts = timestamps[index];
+            
+            const url = `/api/weather?timestamp=${ts}` + 
+                        `&min_lat=${bounds.getSouth()}&max_lat=${bounds.getNorth()}` +
+                        `&min_lon=${bounds.getWest()}&max_lon=${bounds.getEast()}`;
+
+            try {
+                const res = await fetch(url);
+                
+                if (res.status === 400) {
+                     const err = await res.json();
+                     statusDiv.innerText = err.error || "Error";
+                     statusDiv.className = "status-zoom";
+                     return;
+                }
+
+                weatherData = await res.json();
+                
+                drawGrids();
+                statusDiv.innerText = `✅ Loaded ${weatherData.length} grids`;
+                statusDiv.className = "status-ready";
+            } catch (err) {
+                console.error("Error", err);
+                statusDiv.innerText = "Network Error";
+            }
+        }
+
+        // --- DRAWING LOGIC ---
+        function drawGrids() {
+            gridLayer.clearLayers();
+            labelLayer.clearLayers();
+            
+            const selectedLayer = document.getElementById('layer-select').value;
+
+            weatherData.forEach(item => {
+                const bounds = getBounds(item.GridID);
+                if (!bounds) return;
+
+                const val = item[selectedLayer];
+                const color = getColor(selectedLayer, val);
+                
+                // Rectangle
+                L.rectangle(bounds, {
+                    color: color,
+                    weight: 1,
+                    fillColor: color,
+                    fillOpacity: 0.6
+                }).bindPopup(`
+                    <b>${item.LocationName}</b><br>
+                    ${selectedLayer}: ${val}<br>
+                    Source: ${item.IsAnchor ? 'Real Sensor' : 'Interpolated'}
+                `).addTo(gridLayer);
+
+                // Label
+                const centerLat = (bounds[0][0] + bounds[1][0]) / 2;
+                const centerLon = (bounds[0][1] + bounds[1][1]) / 2;
+
+                L.marker([centerLat, centerLon], {
+                    icon: L.divIcon({
+                        className: 'grid-label',
+                        html: item.LocationName,
+                        iconSize: [100, 20]
+                    })
+                }).addTo(labelLayer);
+            });
+        }
+
+        function updateMapColors() {
+            if(weatherData.length > 0) drawGrids();
+        }
+
+        // --- HELPERS ---
+        function getBounds(gridId) {
+            const parts = gridId.split('#');
+            if(parts.length < 3) return null;
+            
+            const gx = parseInt(parts[1]);
+            const gy = parseInt(parts[2]);
+            
+            const minLat = gy * GRID_DEG;
+            const minLon = gx * GRID_DEG;
+            const maxLat = (gy + 1) * GRID_DEG;
+            const maxLon = (gx + 1) * GRID_DEG;
+
+            return [[minLat, minLon], [maxLat, maxLon]];
+        }
+
+        function getColor(type, val) {
+            if (val === null || val === undefined) return '#888';
+
+            if (type === 'Temperature') {
+                if (val < 0) return '#0000ff';
+                if (val < 10) return '#00bfff';
+                if (val < 20) return '#2ecc71';
+                if (val < 30) return '#f1c40f';
+                return '#e74c3c';
+            }
+            else if (type === 'Precipitation') {
+                if (val <= 0.1) return '#bdc3c7'; 
+                if (val < 5) return '#5dade2';   
+                if (val < 20) return '#2e86c1';  
+                return '#8e44ad';                
+            }
+            else if (type === 'WindSpeed') {
+                if (val < 10) return '#abebc6';
+                if (val < 30) return '#f39c12';
+                return '#c0392b';
+            }
+            else if (type === 'Humidity') {
+                if (val < 30) return '#d35400';
+                if (val < 60) return '#f1c40f';
+                return '#3498db';
+            }
+            return '#fff';
+        }
+
+        initMap();
+
+    </script>
+</body>
+</html>
